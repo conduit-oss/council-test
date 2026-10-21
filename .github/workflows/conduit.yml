@@ -1,0 +1,175 @@
+# Conduit: on a PR that bumps a pinned dependency, map the call sites the bump
+# breaks, ask Nemotron 3 Ultra (Nebius Token Factory) for fixes, verify them with
+# the unit tests, and comment the result. It never pushes to the PR branch and
+# never merges.
+name: Conduit
+
+on:
+  pull_request:
+    paths:
+      - "requirements*.txt"
+      - "dev-requirements*.txt"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CONDUIT_SPEC: "git+https://github.com/conduit-oss/conduit.git@2969db86e4dbc4d4891602b6433fc410abb3d573#subdirectory=conduit"  # PR #106 (fix/apply-methods-and-removed-types)
+  CONDUIT_APPLY_MODEL: nvidia/Nemotron-3-Ultra-550b-a55b
+  CONDUIT_APPLY_ENABLE_THINKING: "false"
+  TEST_CMD: python -m pytest -q tests/unit/llm/test_anthropic_llm.py
+
+jobs:
+  conduit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check NEBIUS_API_KEY
+        id: secret
+        env:
+          NEBIUS_API_KEY: ${{ secrets.NEBIUS_API_KEY }}
+        run: |
+          if [ -z "${NEBIUS_API_KEY}" ]; then echo "present=false" >> "$GITHUB_OUTPUT"; else echo "present=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Detect bumped pins from the PR diff
+        if: steps.secret.outputs.present == 'true'
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, re, subprocess
+          pin = re.compile(r"(?mi)^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(?:==|~=)\s*([^\s#;,\\]+)")
+          base = os.environ["BASE_SHA"]
+          def pins(text):
+              return {m.group(1).lower().replace("_", "-"): (m.group(1), m.group(2)) for m in pin.finditer(text)}
+          files = subprocess.check_output(["git", "diff", "--name-only", f"{base}...HEAD", "--", "*requirements*.txt"], text=True).split()
+          changed = {}
+          for name in files:
+              try:
+                  before = subprocess.check_output(["git", "show", f"{base}:{name}"], text=True)
+              except subprocess.CalledProcessError:
+                  before = ""
+              after = pathlib.Path(name).read_text(encoding="utf-8") if pathlib.Path(name).exists() else ""
+              old, new = pins(before), pins(after)
+              for key, (dist, to_ver) in new.items():
+                  if key in old and old[key][1] != to_ver:
+                      changed[key] = [dist, old[key][1], to_ver]
+          pathlib.Path("/tmp/changed.json").write_text(json.dumps(list(changed.values())))
+          summary = "; ".join(f"{d} {a} -> {b}" for d, a, b in changed.values())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"summary={summary}\n")
+              fh.write(f"any={'true' if changed else 'false'}\n")
+          print(summary or "no pinned dependency changed")
+          PY
+
+      - name: Install BASE pins and Conduit (impact needs the old release installed)
+        if: steps.detect.outputs.any == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python -m pip install -U pip
+          git show "${BASE_SHA}:requirements.txt" > /tmp/base-requirements.txt
+          pip install -r /tmp/base-requirements.txt pytest==7.4.4
+          pip install "${CONDUIT_SPEC}"
+
+      - name: Conduit impact (base pins installed)
+        if: steps.detect.outputs.any == 'true'
+        run: |
+          python - <<'PY'
+          import json, pathlib, subprocess
+          merged = {"impacts": [], "deprecations": [], "diffed": [], "notes": []}
+          for dist, old, new in json.loads(pathlib.Path("/tmp/changed.json").read_text()):
+              out = subprocess.check_output(["conduit", "impact", "--dep", dist, "--from", old, "--to", new, "--json"], text=True)
+              payload = json.loads(out)
+              for key in merged:
+                  merged[key].extend(payload.get(key) or [])
+          merged["dependency"] = ",".join(d for d, _, _ in json.loads(pathlib.Path("/tmp/changed.json").read_text()))
+          pathlib.Path("impact.json").write_text(json.dumps(merged, indent=2))
+          print(sum(len(i.get("sites") or []) for i in merged["impacts"]), "impact sites")
+          PY
+          mv impact.json /tmp/impact.json
+
+      - name: Install PR pins
+        if: steps.detect.outputs.any == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Conduit apply (Ultra, thinking off; verifies with tests)
+        if: steps.detect.outputs.any == 'true'
+        id: apply
+        env:
+          NEBIUS_API_KEY: ${{ secrets.NEBIUS_API_KEY }}
+        run: |
+          set +e
+          # httpx logs each Token Factory request at INFO (URL and status only, never the key).
+          python - --impact /tmp/impact.json --write --test-cmd "${TEST_CMD}" --json > /tmp/apply.json 2> /tmp/apply.log <<'PY'
+          import logging, sys
+          logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s %(message)s")
+          logging.getLogger("httpx").setLevel(logging.INFO)
+          from conduit.main import app
+          sys.argv = ["conduit", "apply", *sys.argv[1:]]
+          app()
+          PY
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          git diff -- '*.py' > /tmp/apply.diff
+          grep -m1 "HTTP Request: POST .*chat/completions" /tmp/apply.log > /tmp/tf-call.txt || true
+          ${TEST_CMD} > /tmp/tests-after.txt 2>&1; echo "tests_after_exit=$?" >> /tmp/tests-after.txt
+          tail -5 /tmp/apply.log
+
+      - name: Comment on the PR
+        if: always() && steps.secret.outputs.present == 'true'
+        uses: actions/github-script@v7
+        env:
+          SUMMARY: ${{ steps.detect.outputs.summary }}
+        with:
+          script: |
+            const fs = require('fs');
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return ''; } };
+            const json = (p) => { try { return JSON.parse(read(p)); } catch (e) { return {}; } };
+            const marker = '<!-- conduit -->';
+            const impact = json('/tmp/impact.json');
+            const apply = json('/tmp/apply.json');
+            const sites = [];
+            for (const item of impact.impacts || []) for (const s of item.sites || [])
+              sites.push(`| ${s.path}:${s.line} | \`${(s.expr || '').replace(/\|/g, '\\|')}\` | ${item.change || ''} |${s.via_wrapper ? ' wrapper' : ''}`);
+            const results = (apply.results || []).map(r =>
+              `| ${r.path}:${r.line} | ${r.status} | ${(r.why || r.error || '').split('\n')[0].replace(/\|/g, '\\|').slice(0, 140)} |`);
+            const diff = read('/tmp/apply.diff').trim();
+            const tests = read('/tmp/tests-after.txt').trim().split('\n').slice(-3).join('\n');
+            const body = [
+              marker,
+              '## Conduit',
+              '',
+              `Bump: \`${process.env.SUMMARY || 'none detected'}\`. Model: \`${process.env.CONDUIT_APPLY_MODEL}\` (Nebius Token Factory, enable_thinking=false). Tokens: ${apply.tokens_used ?? 'n/a'}.`,
+              '',
+              'Token Factory call (from the run log):',
+              '```', read('/tmp/tf-call.txt').trim() || '(no model call logged)', '```',
+              '',
+              '### Impact', '', '| Site | Expression | Change |', '| --- | --- | --- |', ...(sites.length ? sites : ['| _none_ | | |']),
+              '',
+              '### Apply', '', '| Site | Status | Why |', '| --- | --- | --- |', ...(results.length ? results : ['| _none_ | | |']),
+              '',
+              `### Tests after apply (\`${process.env.TEST_CMD}\`)`, '```', tests || '(not run)', '```',
+              '',
+              '### Proposed diff', diff ? '```diff\n' + diff.slice(0, 60000) + '\n```' : '_No diff._',
+              '',
+              '_Conduit only comments: it never pushes to this branch and never merges._',
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number, body });
