@@ -16,10 +16,10 @@ permissions:
   pull-requests: write
 
 env:
-  CONDUIT_SPEC: "git+https://github.com/conduit-oss/conduit.git@bb6dcc5ee888a17eb78d5c006b21b1b0dfe7fd5a#subdirectory=conduit"
+  CONDUIT_SPEC: "git+https://github.com/conduit-oss/conduit.git@1bf3b49bf477a142a5067855be0e8859193d7e6c#subdirectory=conduit"
   CONDUIT_APPLY_MODEL: nvidia/Nemotron-3-Ultra-550b-a55b
   CONDUIT_APPLY_ENABLE_THINKING: "false"
-  TEST_CMD: python -m pytest -q tests/unit/llm/test_anthropic_llm.py
+  TEST_CMD: python -m pytest -q tests/unit
 
 jobs:
   conduit:
@@ -102,6 +102,12 @@ jobs:
           PY
           mv impact.json /tmp/impact.json
 
+      - name: Conduit baseline (base pins, base code)
+        if: steps.detect.outputs.any == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: conduit baseline --test-cmd "${TEST_CMD}" --ref "${BASE_SHA}" --out /tmp/baseline.json
+
       - name: Install PR pins
         if: steps.detect.outputs.any == 'true'
         run: pip install -r requirements.txt
@@ -114,7 +120,7 @@ jobs:
         run: |
           set +e
           # httpx logs each Token Factory request at INFO (URL and status only, never the key).
-          python - --impact /tmp/impact.json --write --test-cmd "${TEST_CMD}" --json > /tmp/apply.json 2> /tmp/apply.log <<'PY'
+          python - --impact /tmp/impact.json --write --test-cmd "${TEST_CMD}" --baseline /tmp/baseline.json --json > /tmp/apply.json 2> /tmp/apply.log <<'PY'
           import logging, sys
           logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s %(message)s")
           logging.getLogger("httpx").setLevel(logging.INFO)
@@ -143,7 +149,7 @@ jobs:
             const apply = json('/tmp/apply.json');
             const sites = [];
             for (const item of impact.impacts || []) for (const s of item.sites || [])
-              sites.push(`| ${s.path}:${s.line} | \`${(s.expr || '').replace(/\|/g, '\\|')}\` | ${item.change || ''} |${s.via_wrapper ? ' wrapper' : ''}`);
+              sites.push(`| ${s.path}:${s.line} | \`${(s.expr || '').replace(/\|/g, '\\|')}\` | ${item.change || ''}${s.via_wrapper ? ' (via wrapper)' : ''} |`);
             const results = (apply.results || []).map(r =>
               `| ${r.path}:${r.line} | ${r.status} | ${(r.why || r.error || '').split('\n')[0].replace(/\|/g, '\\|')} |`);
             const diff = read('/tmp/apply.diff').trim();
@@ -162,6 +168,7 @@ jobs:
               '### Apply', '', '| Site | Status | Why |', '| --- | --- | --- |', ...(results.length ? results : ['| _none_ | | |']),
               '',
               `### Tests after apply (\`${process.env.TEST_CMD}\`)`, '```', tests || '(not run)', '```',
+              ...(apply.preexisting_note ? ['', `_${apply.preexisting_note}_`] : []),
               '',
               '### Proposed diff', diff ? '```diff\n' + diff.slice(0, 60000) + '\n```' : '_No diff._',
               '',
