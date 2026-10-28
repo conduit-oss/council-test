@@ -16,7 +16,7 @@ permissions:
   pull-requests: write
 
 env:
-  CONDUIT_SPEC: "git+https://github.com/conduit-oss/conduit.git@c450cab55e9a97a1dfb21e96fc70191a0141268b#subdirectory=conduit"
+  CONDUIT_SPEC: "git+https://github.com/conduit-oss/conduit.git@af6312c96257f7c34ae9fdba94a15c93b595b9a4#subdirectory=conduit"
   CONDUIT_APPLY_MODEL: nvidia/Nemotron-3-Ultra-550b-a55b
   CONDUIT_APPLY_ENABLE_THINKING: "false"
   TEST_CMD: python -m pytest -q tests/unit
